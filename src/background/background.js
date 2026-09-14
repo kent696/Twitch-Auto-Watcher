@@ -17,6 +17,49 @@ const WATCH_TAB_KEY = "watchTabId";
 
 
 // ========================================
+// 自動化功能設定
+// ========================================
+
+async function getAutomationSettings() {
+    const data = await chrome.storage.local.get([
+        "autoWatchEnabled",
+        "autoClaimEnabled"
+    ]);
+
+    return {
+        // 舊版使用者沒有這兩個欄位時，預設維持啟用。
+        autoWatchEnabled:
+            data.autoWatchEnabled !== false,
+
+        autoClaimEnabled:
+            data.autoClaimEnabled !== false
+    };
+}
+
+
+async function ensureAutomationDefaults() {
+    const data = await chrome.storage.local.get([
+        "autoWatchEnabled",
+        "autoClaimEnabled"
+    ]);
+
+    const updates = {};
+
+    if (typeof data.autoWatchEnabled !== "boolean") {
+        updates.autoWatchEnabled = true;
+    }
+
+    if (typeof data.autoClaimEnabled !== "boolean") {
+        updates.autoClaimEnabled = true;
+    }
+
+    if (Object.keys(updates).length > 0) {
+        await chrome.storage.local.set(updates);
+    }
+}
+
+
+// ========================================
 // Twitch Client ID
 // ========================================
 
@@ -104,7 +147,8 @@ chrome.runtime.onInstalled.addListener(() => {
     createStreamCheckAlarm();
     createTokenValidationAlarm();
 
-    restoreTwitchSessionAndCheckStream()
+    ensureAutomationDefaults()
+        .then(() => restoreTwitchSessionAndCheckStream())
         .catch((error) => {
             console.error(
                 "[Twitch Auth]",
@@ -130,7 +174,8 @@ chrome.runtime.onStartup.addListener(() => {
     createStreamCheckAlarm();
     createTokenValidationAlarm();
 
-    restoreTwitchSessionAndCheckStream()
+    ensureAutomationDefaults()
+        .then(() => restoreTwitchSessionAndCheckStream())
         .catch((error) => {
             console.error(
                 "[Twitch Auth]",
@@ -145,6 +190,14 @@ chrome.runtime.onStartup.addListener(() => {
 // Service Worker 被喚醒時確認 Alarm 存在
 createStreamCheckAlarm();
 createTokenValidationAlarm();
+ensureAutomationDefaults()
+    .catch((error) => {
+        console.error(
+            "[Twitch Points Watcher]",
+            "Unable to initialize automation defaults.",
+            error
+        );
+    });
 
 
 
@@ -1173,6 +1226,69 @@ chrome.runtime.onMessage.addListener(
             return true;
         }
 
+        // Popup 更新 Auto Watch / Auto Claim 設定
+        if (
+            message.type ===
+            "UPDATE_AUTOMATION_SETTINGS"
+        ) {
+
+            (async () => {
+                const updates = {};
+
+                if (typeof message.autoWatchEnabled === "boolean") {
+                    updates.autoWatchEnabled =
+                        message.autoWatchEnabled;
+                }
+
+                if (typeof message.autoClaimEnabled === "boolean") {
+                    updates.autoClaimEnabled =
+                        message.autoClaimEnabled;
+                }
+
+                if (Object.keys(updates).length > 0) {
+                    await chrome.storage.local.set(updates);
+                }
+
+                if (updates.autoWatchEnabled === false) {
+                    await closeWatchTab();
+                }
+                else if (updates.autoWatchEnabled === true) {
+                    const stored =
+                        await chrome.storage.local.get([
+                            "channel"
+                        ]);
+
+                    if (stored.channel) {
+                        await checkStreamStatus(
+                            stored.channel
+                        );
+                    }
+                }
+
+                return getAutomationSettings();
+            })()
+                .then((settings) => {
+                    sendResponse({
+                        success: true,
+                        ...settings
+                    });
+                })
+                .catch((error) => {
+                    console.error(
+                        "[Automation]",
+                        "Unable to update automation settings.",
+                        error
+                    );
+
+                    sendResponse({
+                        success: false,
+                        error: error.message
+                    });
+                });
+
+            return true;
+        }
+
         // Content Script 通知已點擊 Bonus Claim
         if (
             message.type ===
@@ -1333,6 +1449,14 @@ async function openWatchTab(channel) {
 }
 
 async function checkWatchTabHealth() {
+
+    const settings =
+        await getAutomationSettings();
+
+    if (!settings.autoWatchEnabled) {
+        await closeWatchTab();
+        return;
+    }
 
     const data =
         await chrome.storage.local.get([
@@ -1748,9 +1872,22 @@ async function checkStreamStatus(channel) {
         });
 
 
-        await openWatchTab(
-            channel
-        );
+        const automation =
+            await getAutomationSettings();
+
+        if (automation.autoWatchEnabled) {
+            await openWatchTab(
+                channel
+            );
+        }
+        else {
+            await closeWatchTab();
+
+            console.log(
+                "[Auto Watch]",
+                "Auto Watch is disabled."
+            );
+        }
 
 
         return stream;

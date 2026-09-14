@@ -152,10 +152,29 @@ function isButtonUsable(button) {
 
 
 // ========================================
+// Auto Claim 設定
+// ========================================
+
+async function isAutoClaimEnabled() {
+    const data =
+        await chrome.storage.local.get([
+            "autoClaimEnabled"
+        ]);
+
+    // 舊版尚未建立設定時預設為開啟。
+    return data.autoClaimEnabled !== false;
+}
+
+
+// ========================================
 // 領取 Bonus
 // ========================================
 
 async function tryClaimBonus() {
+    if (!(await isAutoClaimEnabled())) {
+        return false;
+    }
+
     if (
         Date.now() - lastClaimAt <
         CLAIM_COOLDOWN_MS

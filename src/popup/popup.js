@@ -13,6 +13,13 @@ const watchingChannelText = document.getElementById("watchingChannel");
 const claimCountText = document.getElementById("claimCount");
 const lastClaimText = document.getElementById("lastClaim");
 
+const autoWatchToggle =
+    document.getElementById("autoWatchEnabled");
+const autoClaimToggle =
+    document.getElementById("autoClaimEnabled");
+const automationStatusText =
+    document.getElementById("automationStatus");
+
 
 function normalizeChannel(value) {
     let channel = String(value || "").trim();
@@ -79,7 +86,9 @@ async function loadPopupState() {
         "streamStatus",
         "watchingChannel",
         "totalClaimCount",
-        "lastClaimAt"
+        "lastClaimAt",
+        "autoWatchEnabled",
+        "autoClaimEnabled"
     ]);
 
     if (data.channel) {
@@ -171,6 +180,12 @@ async function loadPopupState() {
 
     lastClaimText.textContent =
         formatDateTime(data.lastClaimAt);
+
+    autoWatchToggle.checked =
+        data.autoWatchEnabled !== false;
+
+    autoClaimToggle.checked =
+        data.autoClaimEnabled !== false;
 }
 
 
@@ -329,6 +344,57 @@ disconnectTwitchButton.addEventListener(
 );
 
 
+async function updateAutomationSettings() {
+    autoWatchToggle.disabled = true;
+    autoClaimToggle.disabled = true;
+    automationStatusText.textContent =
+        "Saving automation settings...";
+
+    try {
+        const response =
+            await chrome.runtime.sendMessage({
+                type: "UPDATE_AUTOMATION_SETTINGS",
+                autoWatchEnabled:
+                    autoWatchToggle.checked,
+                autoClaimEnabled:
+                    autoClaimToggle.checked
+            });
+
+        if (!response?.success) {
+            throw new Error(
+                response?.error ||
+                "Unable to save automation settings."
+            );
+        }
+
+        automationStatusText.textContent =
+            "Automation settings saved.";
+    }
+    catch (error) {
+        automationStatusText.textContent =
+            "Unable to save automation settings.";
+
+        await loadPopupState();
+    }
+    finally {
+        autoWatchToggle.disabled = false;
+        autoClaimToggle.disabled = false;
+    }
+}
+
+
+autoWatchToggle.addEventListener(
+    "change",
+    updateAutomationSettings
+);
+
+
+autoClaimToggle.addEventListener(
+    "change",
+    updateAutomationSettings
+);
+
+
 chrome.storage.onChanged.addListener(
     (changes, areaName) => {
         if (areaName !== "local") {
@@ -344,7 +410,9 @@ chrome.storage.onChanged.addListener(
             "streamStatus",
             "watchingChannel",
             "totalClaimCount",
-            "lastClaimAt"
+            "lastClaimAt",
+            "autoWatchEnabled",
+            "autoClaimEnabled"
         ]);
 
         const shouldRefresh =
