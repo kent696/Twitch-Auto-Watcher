@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch Points Watcher",
+  "version": "0.1.1",
+  "description": "Automatically monitors Twitch streams and manages viewing for Channel Points.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.twitch.tv/*",
+    "https://api.twitch.tv/*",
+    "https://id.twitch.tv/*"
+  ],
+  "background": {
+    "service_worker": "src/background/background.js"
+  },
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Twitch Points Watcher"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.twitch.tv/*"
+      ],
+      "js": [
+        "src/content/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

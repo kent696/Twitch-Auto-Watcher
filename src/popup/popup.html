@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Twitch Points Watcher</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+    <main class="container">
+        <header class="header">
+            <h1>Twitch Points Watcher</h1>
+            <p class="description">Automatic Twitch stream watcher</p>
+        </header>
+
+        <section class="card">
+            <div class="row row-top">
+                <span class="label">Twitch Account</span>
+                <span id="accountBadge" class="badge neutral">Not connected</span>
+            </div>
+            <div id="accountName" class="value muted">--</div>
+
+            <button id="connectTwitch" class="primary-button" type="button">
+                Connect Twitch
+            </button>
+
+            <button id="disconnectTwitch" class="secondary-button hidden" type="button">
+                Disconnect Twitch
+            </button>
+
+            <p id="authStatus" class="message"></p>
+        </section>
+
+        <section class="card">
+            <label class="label" for="channel">Twitch Channel</label>
+            <input
+                id="channel"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="e.g. dasoku_aniki"
+            >
+
+            <button id="save" class="primary-button" type="button">
+                Save Channel
+            </button>
+
+            <p id="status" class="message"></p>
+        </section>
+
+        <section class="card status-card">
+            <div class="status-line">
+                <span class="label">Stream Status</span>
+                <span id="streamStatus" class="badge neutral">Unknown</span>
+            </div>
+
+            <div class="info-grid">
+                <div class="info-item">
+                    <span class="info-label">Watching</span>
+                    <span id="watchingChannel" class="info-value">--</span>
+                </div>
+
+                <div class="info-item">
+                    <span class="info-label">Claims</span>
+                    <span id="claimCount" class="info-value">0</span>
+                </div>
+
+                <div class="info-item full-width">
+                    <span class="info-label">Last Claim</span>
+                    <span id="lastClaim" class="info-value">--</span>
+                </div>
+            </div>
+        </section>
+
+        <p class="footer-note">
+            Chrome must remain running for automatic monitoring to continue.
+        </p>
+    </main>
+
+    <script src="popup.js"></script>
+</body>
+</html>
