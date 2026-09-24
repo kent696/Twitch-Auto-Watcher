@@ -9,8 +9,11 @@
 <body>
     <main class="container">
         <header class="header">
-            <h1>Twitch Points Watcher</h1>
-            <p class="description">Automatic Twitch stream watcher</p>
+            <div>
+                <h1>Twitch Points Watcher</h1>
+                <p class="description">Automatic Twitch stream watcher</p>
+            </div>
+            <span class="version-badge">v0.1.3</span>
         </header>
 
         <section class="card">
@@ -38,7 +41,7 @@
                 type="text"
                 autocomplete="off"
                 spellcheck="false"
-                placeholder="e.g. Twitch"
+                placeholder="e.g. twitch"
             >
 
             <button id="save" class="primary-button" type="button">
@@ -79,6 +82,27 @@
                 </span>
             </label>
 
+            <div class="setting-row">
+                <span class="toggle-copy">
+                    <span class="toggle-title">Check Interval</span>
+                    <span class="toggle-description">
+                        How often the extension checks the configured channel.
+                    </span>
+                </span>
+
+                <select id="streamCheckInterval" aria-label="Stream check interval">
+                    <option value="0.5">30 sec</option>
+                    <option value="1">1 min</option>
+                    <option value="2">2 min</option>
+                    <option value="5">5 min</option>
+                    <option value="10">10 min</option>
+                </select>
+            </div>
+
+            <button id="checkNow" class="secondary-button" type="button">
+                Check Now
+            </button>
+
             <p id="automationStatus" class="message"></p>
         </section>
 
@@ -88,6 +112,11 @@
                 <span id="streamStatus" class="badge neutral">Unknown</span>
             </div>
 
+            <div class="status-line secondary-status-line">
+                <span class="label">Watch State</span>
+                <span id="watchState" class="badge neutral">IDLE</span>
+            </div>
+
             <div class="info-grid">
                 <div class="info-item">
                     <span class="info-label">Watching</span>
@@ -95,15 +124,63 @@
                 </div>
 
                 <div class="info-item">
+                    <span class="info-label">Current Watch</span>
+                    <span id="currentWatchDuration" class="info-value">--</span>
+                </div>
+
+                <div class="info-item">
+                    <span class="info-label">Last Checked</span>
+                    <span id="lastChecked" class="info-value">--</span>
+                </div>
+
+                <div class="info-item">
+                    <span class="info-label">Last LIVE</span>
+                    <span id="lastLiveDetected" class="info-value">--</span>
+                </div>
+
+                <div class="info-item">
+                    <span class="info-label">Last Watched</span>
+                    <span id="lastWatched" class="info-value">--</span>
+                </div>
+
+                <div class="info-item">
+                    <span class="info-label">Total Watch</span>
+                    <span id="totalWatchDuration" class="info-value">0m</span>
+                </div>
+
+                <div class="info-item">
                     <span class="info-label">Claims</span>
                     <span id="claimCount" class="info-value">0</span>
                 </div>
 
-                <div class="info-item full-width">
+                <div class="info-item">
                     <span class="info-label">Last Claim</span>
                     <span id="lastClaim" class="info-value">--</span>
                 </div>
             </div>
+        </section>
+
+        <section class="card">
+            <div class="section-heading">Diagnostics</div>
+            <div class="diagnostic-row">
+                <span class="info-label">Last Error</span>
+                <span id="lastError" class="diagnostic-value">None</span>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="row row-top">
+                <span class="section-heading">Recent Watch Sessions</span>
+            </div>
+            <div id="watchHistory" class="timeline empty-state">No watch sessions yet.</div>
+        </section>
+
+        <section class="card">
+            <div class="row row-top">
+                <span class="section-heading">Activity Log</span>
+                <button id="clearActivity" class="text-button" type="button">Clear</button>
+            </div>
+            <div id="activityLog" class="timeline empty-state">No activity yet.</div>
         </section>
 
         <p class="footer-note">
