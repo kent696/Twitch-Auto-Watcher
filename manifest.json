@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Twitch Points Watcher",
-  "version": "0.1.2",
-  "description": "Automatically monitors Twitch streams and manages viewing for Channel Points.",
+  "version": "0.1.3",
+  "description": "Automatically monitors Twitch streams, manages background viewing, and tracks Channel Points claim activity.",
   "permissions": [
     "storage",
     "alarms",

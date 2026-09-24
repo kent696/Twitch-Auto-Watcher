@@ -3,7 +3,7 @@
 // ========================================
 
 
-// 每 2 分鐘檢查直播
+// 定期檢查直播
 const STREAM_CHECK_ALARM = "streamCheck";
 
 // Twitch 登入授權輪詢
@@ -15,6 +15,232 @@ const TWITCH_VALIDATE_ALARM = "twitchTokenValidate";
 // Extension 自動建立的觀看分頁 ID
 const WATCH_TAB_KEY = "watchTabId";
 
+const DEFAULT_STREAM_CHECK_INTERVAL = 2;
+const ALLOWED_STREAM_CHECK_INTERVALS = [0.5, 1, 2, 5, 10];
+const MAX_ACTIVITY_LOG = 200;
+const MAX_WATCH_HISTORY = 100;
+
+const closingManagedTabs = new Set();
+let activityWriteQueue = Promise.resolve();
+let watchHistoryWriteQueue = Promise.resolve();
+
+
+function normalizeStreamCheckInterval(value) {
+    const number = Number(value);
+
+    if (ALLOWED_STREAM_CHECK_INTERVALS.includes(number)) {
+        return number;
+    }
+
+    return DEFAULT_STREAM_CHECK_INTERVAL;
+}
+
+
+function appendActivity(type, {
+    channel = null,
+    message = "",
+    details = null,
+    at = Date.now()
+} = {}) {
+    activityWriteQueue = activityWriteQueue
+        .then(async () => {
+            const stored =
+                await chrome.storage.local.get([
+                    "activityLog"
+                ]);
+
+            const activityLog =
+                Array.isArray(stored.activityLog)
+                    ? stored.activityLog
+                    : [];
+
+            activityLog.unshift({
+                type,
+                channel,
+                message,
+                details,
+                at: Number(at) || Date.now()
+            });
+
+            await chrome.storage.local.set({
+                activityLog:
+                    activityLog.slice(0, MAX_ACTIVITY_LOG)
+            });
+        })
+        .catch((error) => {
+            console.error(
+                "[Activity Log] Unable to record activity.",
+                error
+            );
+        });
+
+    return activityWriteQueue;
+}
+
+
+async function recordLastError(source, error, channel = null) {
+    const message = String(
+        error?.message ||
+        error ||
+        "Unknown error"
+    );
+
+    const entry = {
+        source,
+        message,
+        channel,
+        at: Date.now()
+    };
+
+    await chrome.storage.local.set({
+        lastError: entry
+    });
+
+    await appendActivity("error", {
+        channel,
+        message: `${source}: ${message}`,
+        at: entry.at
+    });
+}
+
+
+async function beginWatchSession(channel, tabId) {
+    const stored =
+        await chrome.storage.local.get([
+            "watchSession"
+        ]);
+
+    const current = stored.watchSession;
+
+    if (
+        current &&
+        current.channel === channel &&
+        current.tabId === tabId
+    ) {
+        return current;
+    }
+
+    if (current) {
+        await endWatchSession("channel_changed");
+    }
+
+    const session = {
+        channel,
+        tabId,
+        startAt: Date.now()
+    };
+
+    await chrome.storage.local.set({
+        watchSession: session,
+        watchState: "opening",
+        watchingChannel: channel,
+        lastWatchStartedAt: session.startAt,
+        lastPlaybackHeartbeatAt: 0,
+        playbackConfirmationFailureSessionStartAt: 0
+    });
+
+    await appendActivity("watch_started", {
+        channel,
+        message: "Managed Twitch watch tab started.",
+        at: session.startAt
+    });
+
+    return session;
+}
+
+
+function endWatchSession(reason = "ended") {
+    watchHistoryWriteQueue = watchHistoryWriteQueue
+        .then(async () => {
+            const stored =
+                await chrome.storage.local.get([
+                    "watchSession",
+                    "watchHistory",
+                    "totalWatchDurationMs",
+                    "lastPlaybackHeartbeatAt"
+                ]);
+
+            const session = stored.watchSession;
+
+            if (!session?.startAt) {
+                await chrome.storage.local.set({
+                    watchState: "idle"
+                });
+                return null;
+            }
+
+            const now = Date.now();
+            const lastHeartbeat =
+                Number(stored.lastPlaybackHeartbeatAt || 0);
+
+            // If Chrome was closed for a long time, avoid counting the
+            // entire browser-offline period as watch time.
+            const endAt =
+                lastHeartbeat &&
+                now - lastHeartbeat > 180000
+                    ? lastHeartbeat
+                    : now;
+
+            const durationMs = Math.max(
+                0,
+                endAt - Number(session.startAt)
+            );
+
+            const history =
+                Array.isArray(stored.watchHistory)
+                    ? stored.watchHistory
+                    : [];
+
+            const historyItem = {
+                channel: session.channel || "unknown",
+                tabId: session.tabId || null,
+                startAt: Number(session.startAt),
+                endAt,
+                durationMs,
+                reason
+            };
+
+            history.unshift(historyItem);
+
+            await chrome.storage.local.set({
+                watchHistory:
+                    history.slice(0, MAX_WATCH_HISTORY),
+                lastWatchDurationMs: durationMs,
+                totalWatchDurationMs:
+                    Number(stored.totalWatchDurationMs || 0) +
+                    durationMs,
+                lastWatchEndedAt: endAt,
+                watchState: "idle"
+            });
+
+            await chrome.storage.local.remove([
+                "watchSession",
+                "lastPlaybackHeartbeatAt",
+                "playbackConfirmationFailureSessionStartAt"
+            ]);
+
+            await appendActivity("watch_stopped", {
+                channel: historyItem.channel,
+                message: "Managed watch session ended.",
+                details: {
+                    reason,
+                    durationMs
+                },
+                at: endAt
+            });
+
+            return historyItem;
+        })
+        .catch(async (error) => {
+            console.error(
+                "[Watch History] Unable to close watch session.",
+                error
+            );
+        });
+
+    return watchHistoryWriteQueue;
+}
+
 
 // ========================================
 // 自動化功能設定
@@ -23,7 +249,9 @@ const WATCH_TAB_KEY = "watchTabId";
 async function getAutomationSettings() {
     const data = await chrome.storage.local.get([
         "autoWatchEnabled",
-        "autoClaimEnabled"
+        "autoClaimEnabled",
+        "streamCheckInterval",
+        "watchState"
     ]);
 
     return {
@@ -40,7 +268,9 @@ async function getAutomationSettings() {
 async function ensureAutomationDefaults() {
     const data = await chrome.storage.local.get([
         "autoWatchEnabled",
-        "autoClaimEnabled"
+        "autoClaimEnabled",
+        "streamCheckInterval",
+        "watchState"
     ]);
 
     const updates = {};
@@ -51,6 +281,19 @@ async function ensureAutomationDefaults() {
 
     if (typeof data.autoClaimEnabled !== "boolean") {
         updates.autoClaimEnabled = true;
+    }
+
+    if (
+        !ALLOWED_STREAM_CHECK_INTERVALS.includes(
+            Number(data.streamCheckInterval)
+        )
+    ) {
+        updates.streamCheckInterval =
+            DEFAULT_STREAM_CHECK_INTERVAL;
+    }
+
+    if (typeof data.watchState !== "string") {
+        updates.watchState = "idle";
     }
 
     if (Object.keys(updates).length > 0) {
@@ -75,29 +318,47 @@ const TWITCH_SCOPES = "";
 // 建立直播檢查排程
 // ========================================
 
-function createStreamCheckAlarm() {
+async function createStreamCheckAlarm(force = false) {
+    const stored =
+        await chrome.storage.local.get([
+            "streamCheckInterval"
+        ]);
 
-    chrome.alarms.get(
+    const interval =
+        normalizeStreamCheckInterval(
+            stored.streamCheckInterval
+        );
+
+    const existing =
+        await chrome.alarms.get(
+            STREAM_CHECK_ALARM
+        );
+
+    if (
+        !force &&
+        existing &&
+        Number(existing.periodInMinutes) === interval
+    ) {
+        return interval;
+    }
+
+    await chrome.alarms.clear(
+        STREAM_CHECK_ALARM
+    );
+
+    chrome.alarms.create(
         STREAM_CHECK_ALARM,
-        (alarm) => {
-
-            if (alarm) {
-                return;
-            }
-
-            chrome.alarms.create(
-                STREAM_CHECK_ALARM,
-                {
-                    periodInMinutes: 2
-                }
-            );
-
-            console.log(
-                "[Twitch Points Watcher]",
-                "Stream check alarm created."
-            );
+        {
+            periodInMinutes: interval
         }
     );
+
+    console.log(
+        "[Twitch Points Watcher]",
+        `Stream check alarm set to ${interval} minute(s).`
+    );
+
+    return interval;
 }
 
 
@@ -188,7 +449,14 @@ chrome.runtime.onStartup.addListener(() => {
 
 
 // Service Worker 被喚醒時確認 Alarm 存在
-createStreamCheckAlarm();
+createStreamCheckAlarm()
+    .catch((error) => {
+        console.error(
+            "[Twitch Points Watcher]",
+            "Unable to initialize stream check alarm.",
+            error
+        );
+    });
 createTokenValidationAlarm();
 ensureAutomationDefaults()
     .catch((error) => {
@@ -1057,6 +1325,12 @@ function recordChannelPointsClaim(channel, claimedAt) {
                 "[Channel Points] Claim recorded for",
                 normalizedChannel
             );
+
+            await appendActivity("claim", {
+                channel: normalizedChannel,
+                message: "Channel Points bonus claim recorded.",
+                at: timestamp
+            });
         })
         .catch((error) => {
             console.error(
@@ -1174,10 +1448,15 @@ chrome.runtime.onMessage.addListener(
                         live: Boolean(stream)
                     });
                 })
-                .catch((error) => {
+                .catch(async (error) => {
                     console.error(
                         "[Stream Check]",
                         "Manual stream check failed.",
+                        error
+                    );
+
+                    await recordLastError(
+                        "Manual Stream Check",
                         error
                     );
 
@@ -1250,7 +1529,7 @@ chrome.runtime.onMessage.addListener(
                 }
 
                 if (updates.autoWatchEnabled === false) {
-                    await closeWatchTab();
+                    await closeWatchTab("auto_watch_disabled");
                 }
                 else if (updates.autoWatchEnabled === true) {
                     const stored =
@@ -1289,6 +1568,183 @@ chrome.runtime.onMessage.addListener(
             return true;
         }
 
+        // Popup 更新直播檢查間隔
+        if (
+            message.type ===
+            "UPDATE_STREAM_CHECK_INTERVAL"
+        ) {
+            (async () => {
+                const interval =
+                    normalizeStreamCheckInterval(
+                        message.interval
+                    );
+
+                await chrome.storage.local.set({
+                    streamCheckInterval: interval
+                });
+
+                await createStreamCheckAlarm(true);
+
+                await appendActivity("interval_changed", {
+                    message:
+                        `Stream check interval changed to ${interval} minute(s).`
+                });
+
+                return interval;
+            })()
+                .then((interval) => {
+                    sendResponse({
+                        success: true,
+                        interval
+                    });
+                })
+                .catch((error) => {
+                    recordLastError(
+                        "Interval Settings",
+                        error
+                    );
+
+                    sendResponse({
+                        success: false,
+                        error: error.message
+                    });
+                });
+
+            return true;
+        }
+
+        // Popup 清除 Activity Log
+        if (
+            message.type ===
+            "CLEAR_ACTIVITY_LOG"
+        ) {
+            chrome.storage.local.set({
+                activityLog: []
+            })
+                .then(() => {
+                    sendResponse({ success: true });
+                })
+                .catch((error) => {
+                    sendResponse({
+                        success: false,
+                        error: error.message
+                    });
+                });
+
+            return true;
+        }
+
+        // Content Script 已在 Extension 管理的 Twitch 頁面啟動
+        if (
+            message.type ===
+            "WATCH_CONTENT_ACTIVE"
+        ) {
+            (async () => {
+                const stored =
+                    await chrome.storage.local.get([
+                        "watchState"
+                    ]);
+
+                await chrome.storage.local.set({
+                    contentScriptActiveAt:
+                        Number(message.at) || Date.now()
+                });
+
+                if (stored.watchState === "opening") {
+                    await appendActivity(
+                        "content_script_active",
+                        {
+                            channel: message.channel || null,
+                            message:
+                                "Content script attached to the managed Twitch page.",
+                            at: message.at
+                        }
+                    );
+                }
+
+                sendResponse({ success: true });
+            })()
+                .catch((error) => {
+                    sendResponse({
+                        success: false,
+                        error: error.message
+                    });
+                });
+
+            return true;
+        }
+
+        // Content Script 回報播放器仍在正常播放
+        if (
+            message.type ===
+            "WATCH_PLAYBACK_HEARTBEAT"
+        ) {
+            (async () => {
+                const timestamp =
+                    Number(message.at) || Date.now();
+
+                const stored =
+                    await chrome.storage.local.get([
+                        "watchState"
+                    ]);
+
+                await chrome.storage.local.set({
+                    watchState: "watching",
+                    lastWatchedAt: timestamp,
+                    lastPlaybackHeartbeatAt: timestamp
+                });
+
+                await chrome.storage.local.remove(
+                    "playbackConfirmationFailureSessionStartAt"
+                );
+
+                if (stored.watchState !== "watching") {
+                    await appendActivity(
+                        "playback_confirmed",
+                        {
+                            channel: message.channel || null,
+                            message:
+                                "Twitch video playback was confirmed.",
+                            at: timestamp
+                        }
+                    );
+                }
+
+                sendResponse({ success: true });
+            })()
+                .catch((error) => {
+                    sendResponse({
+                        success: false,
+                        error: error.message
+                    });
+                });
+
+            return true;
+        }
+
+        // Content Script 無法恢復播放器
+        if (
+            message.type ===
+            "WATCH_PLAYBACK_ERROR"
+        ) {
+            recordLastError(
+                "Playback",
+                message.error ||
+                    "Playback could not be resumed.",
+                message.channel || null
+            )
+                .then(() => {
+                    return chrome.storage.local.set({
+                        watchState: "error"
+                    });
+                })
+                .then(() => {
+                    sendResponse({ success: true });
+                });
+
+            return true;
+        }
+
         // Content Script 通知已點擊 Bonus Claim
         if (
             message.type ===
@@ -1315,39 +1771,27 @@ chrome.runtime.onMessage.addListener(
 // ========================================
 
 async function openWatchTab(channel) {
-
     const expectedUrl =
         `https://www.twitch.tv/${channel}`;
 
-
     const data =
         await chrome.storage.local.get([
-            WATCH_TAB_KEY
+            WATCH_TAB_KEY,
+            "watchSession"
         ]);
 
+    const savedTabId = data[WATCH_TAB_KEY];
 
-    const savedTabId =
-        data[WATCH_TAB_KEY];
-
-
-    // 已經有 Extension 建立的觀看分頁
     if (savedTabId) {
-
         try {
-
             const tab =
-                await chrome.tabs.get(
-                    savedTabId
-                );
+                await chrome.tabs.get(savedTabId);
 
-
-            // 如果目前分頁不是指定頻道，切換到新的頻道
             if (
                 !tab.url ||
-                !tab.url.startsWith(
-                    expectedUrl
-                )
+                !tab.url.startsWith(expectedUrl)
             ) {
+                await endWatchSession("channel_changed");
 
                 await chrome.tabs.update(
                     savedTabId,
@@ -1359,14 +1803,12 @@ async function openWatchTab(channel) {
                     }
                 );
 
-
                 console.log(
                     "[Auto Watch]",
                     `Updated watch tab to ${channel}.`
                 );
             }
             else {
-
                 await chrome.tabs.update(
                     savedTabId,
                     {
@@ -1376,28 +1818,32 @@ async function openWatchTab(channel) {
                     }
                 );
 
-
                 console.log(
                     "[Auto Watch]",
                     `Watch tab already exists for ${channel}.`
                 );
             }
 
-
-            await chrome.storage.local.set({
-                watchingChannel: channel
-            });
-
+            await beginWatchSession(
+                channel,
+                savedTabId
+            );
 
             return savedTabId;
         }
         catch (error) {
+            await appendActivity("tab_missing", {
+                channel,
+                message:
+                    "Saved managed watch tab no longer exists."
+            });
+
+            await endWatchSession("tab_missing");
 
             await chrome.storage.local.remove([
                 WATCH_TAB_KEY,
                 "watchingChannel"
             ]);
-
 
             console.log(
                 "[Auto Watch]",
@@ -1406,8 +1852,10 @@ async function openWatchTab(channel) {
         }
     }
 
+    await chrome.storage.local.set({
+        watchState: "opening"
+    });
 
-    // 建立新的 Twitch 觀看分頁
     const tab =
         await chrome.tabs.create({
             url: expectedUrl,
@@ -1415,13 +1863,23 @@ async function openWatchTab(channel) {
             pinned: true
         });
 
-
     if (!tab.id) {
-        throw new Error(
+        const error = new Error(
             "Unable to create Twitch watch tab."
         );
-    }
 
+        await recordLastError(
+            "Auto Watch",
+            error,
+            channel
+        );
+
+        await chrome.storage.local.set({
+            watchState: "error"
+        });
+
+        throw error;
+    }
 
     await chrome.tabs.update(
         tab.id,
@@ -1432,66 +1890,54 @@ async function openWatchTab(channel) {
         }
     );
 
-
     await chrome.storage.local.set({
         [WATCH_TAB_KEY]: tab.id,
         watchingChannel: channel
     });
 
+    await beginWatchSession(
+        channel,
+        tab.id
+    );
 
     console.log(
         "[Auto Watch]",
         `Opened watch tab for ${channel}.`
     );
 
-
     return tab.id;
 }
 
 async function checkWatchTabHealth() {
-
     const settings =
         await getAutomationSettings();
 
     if (!settings.autoWatchEnabled) {
-        await closeWatchTab();
+        await closeWatchTab("auto_watch_disabled");
         return;
     }
 
     const data =
         await chrome.storage.local.get([
             WATCH_TAB_KEY,
-            "watchingChannel"
+            "watchingChannel",
+            "watchState",
+            "watchSession",
+            "lastPlaybackHeartbeatAt",
+            "playbackConfirmationFailureSessionStartAt"
         ]);
 
-    const tabId =
-        data[WATCH_TAB_KEY];
-
-    const channel =
-        data.watchingChannel;
-
+    const tabId = data[WATCH_TAB_KEY];
+    const channel = data.watchingChannel;
 
     if (!tabId || !channel) {
         return;
     }
 
-
     try {
-
         const tab =
             await chrome.tabs.get(tabId);
 
-
-        console.log(
-            "[Tab Health]",
-            "discarded:",
-            tab.discarded,
-            "frozen:",
-            tab.frozen
-        );
-
-
-        // 再次確保 Chrome 不要自動丟棄
         await chrome.tabs.update(
             tabId,
             {
@@ -1501,70 +1947,133 @@ async function checkWatchTabHealth() {
             }
         );
 
+        const now = Date.now();
+        const sessionStart =
+            Number(data.watchSession?.startAt || 0);
+        const lastHeartbeat =
+            Number(data.lastPlaybackHeartbeatAt || 0);
 
-        // 被 Chrome discard 的情況
+        // If the page was opened but playback was never confirmed within
+        // two minutes, surface a visible diagnostic instead of silently
+        // leaving the user unsure whether Auto Watch worked.
+        if (
+            sessionStart &&
+            !lastHeartbeat &&
+            now - sessionStart > 120000 &&
+            Number(
+                data.playbackConfirmationFailureSessionStartAt || 0
+            ) !== sessionStart
+        ) {
+            await chrome.storage.local.set({
+                watchState: "error",
+                playbackConfirmationFailureSessionStartAt:
+                    sessionStart
+            });
+
+            await recordLastError(
+                "Auto Watch",
+                "Playback was not confirmed within 2 minutes.",
+                channel
+            );
+        }
+
+        // A managed tab that previously reported playback but stopped
+        // reporting for more than three minutes is reloaded once the
+        // scheduled health check notices it.
+        if (
+            lastHeartbeat &&
+            now - lastHeartbeat > 180000 &&
+            data.watchState === "watching"
+        ) {
+            await chrome.storage.local.set({
+                watchState: "opening",
+                lastPlaybackHeartbeatAt: 0
+            });
+
+            await appendActivity("tab_reloaded", {
+                channel,
+                message:
+                    "Playback heartbeat became stale. Reloading managed tab.",
+                details: { reason: "playback_stale" }
+            });
+
+            await chrome.tabs.reload(tabId);
+            return;
+        }
+
         if (tab.discarded) {
-
             console.log(
                 "[Tab Health]",
                 "Watch tab was discarded. Reloading."
             );
 
+            await chrome.storage.local.set({
+                watchState: "opening"
+            });
 
-            await chrome.tabs.reload(
-                tabId
-            );
+            await appendActivity("tab_reloaded", {
+                channel,
+                message:
+                    "Managed watch tab was discarded and reloaded.",
+                details: { reason: "discarded" }
+            });
 
-
+            await chrome.tabs.reload(tabId);
             return;
         }
 
-
-        // Chrome 132+ 才有 frozen
         if (tab.frozen) {
-
             console.log(
                 "[Tab Health]",
                 "Watch tab is frozen."
             );
 
-            // 這裡先用 reload 恢復
-            await chrome.tabs.reload(
-                tabId
-            );
+            await chrome.storage.local.set({
+                watchState: "opening"
+            });
 
+            await appendActivity("tab_reloaded", {
+                channel,
+                message:
+                    "Managed watch tab was frozen and reloaded.",
+                details: { reason: "frozen" }
+            });
+
+            await chrome.tabs.reload(tabId);
         }
-
     }
     catch (error) {
-
         console.log(
             "[Tab Health]",
             "Watch tab no longer exists."
         );
 
+        await appendActivity("tab_missing", {
+            channel,
+            message:
+                "Managed watch tab could not be found."
+        });
+
+        await endWatchSession("tab_missing");
 
         await chrome.storage.local.remove([
             WATCH_TAB_KEY,
             "watchingChannel"
         ]);
-
     }
 }
 
-async function closeWatchTab() {
-
+async function closeWatchTab(reason = "ended") {
     const data =
         await chrome.storage.local.get([
-            WATCH_TAB_KEY
+            WATCH_TAB_KEY,
+            "watchingChannel"
         ]);
 
-
-    const tabId =
-        data[WATCH_TAB_KEY];
-
+    const tabId = data[WATCH_TAB_KEY];
 
     if (!tabId) {
+        await endWatchSession(reason);
 
         await chrome.storage.local.remove(
             "watchingChannel"
@@ -1573,27 +2082,19 @@ async function closeWatchTab() {
         return;
     }
 
-
     try {
-
         const tab =
-            await chrome.tabs.get(
-                tabId
-            );
+            await chrome.tabs.get(tabId);
 
-
-        // 只處理 Twitch 網址，避免誤關其他分頁
         if (
             tab.url &&
             tab.url.startsWith(
                 "https://www.twitch.tv/"
             )
         ) {
+            closingManagedTabs.add(tabId);
 
-            await chrome.tabs.remove(
-                tabId
-            );
-
+            await chrome.tabs.remove(tabId);
 
             console.log(
                 "[Auto Watch]",
@@ -1601,7 +2102,6 @@ async function closeWatchTab() {
             );
         }
         else {
-
             console.warn(
                 "[Auto Watch]",
                 "Saved tab is no longer a Twitch page. It will not be closed."
@@ -1609,13 +2109,13 @@ async function closeWatchTab() {
         }
     }
     catch (error) {
-
         console.log(
             "[Auto Watch]",
             "Watch tab was already closed."
         );
     }
 
+    await endWatchSession(reason);
 
     await chrome.storage.local.remove([
         WATCH_TAB_KEY,
@@ -1627,28 +2127,35 @@ async function closeWatchTab() {
 // 使用者手動關閉自動觀看分頁時，同步清除紀錄
 chrome.tabs.onRemoved.addListener(
     async (tabId) => {
-
         const data =
             await chrome.storage.local.get([
-                WATCH_TAB_KEY
-            ]);
-
-
-        if (
-            data[WATCH_TAB_KEY] === tabId
-        ) {
-
-            await chrome.storage.local.remove([
                 WATCH_TAB_KEY,
                 "watchingChannel"
             ]);
 
-
-            console.log(
-                "[Auto Watch]",
-                "Watch tab was manually closed."
-            );
+        if (data[WATCH_TAB_KEY] !== tabId) {
+            return;
         }
+
+        if (closingManagedTabs.has(tabId)) {
+            closingManagedTabs.delete(tabId);
+            return;
+        }
+
+        const channel =
+            data.watchingChannel || null;
+
+        await endWatchSession("manual_close");
+
+        await chrome.storage.local.remove([
+            WATCH_TAB_KEY,
+            "watchingChannel"
+        ]);
+
+        console.log(
+            "[Auto Watch]",
+            "Watch tab was manually closed."
+        );
     }
 );
 
@@ -1658,6 +2165,12 @@ chrome.tabs.onRemoved.addListener(
 // ========================================
 
 async function checkStreamStatus(channel) {
+    const checkStartedAt = Date.now();
+
+    await chrome.storage.local.set({
+        streamStatus: "checking",
+        streamCheckStartedAt: checkStartedAt
+    });
 
     console.log(
         "[Stream Check]",
@@ -1700,7 +2213,7 @@ async function checkStreamStatus(channel) {
             streamCheckedAt: Date.now()
         });
 
-        await closeWatchTab();
+        await closeWatchTab("not_connected");
 
         return null;
     }
@@ -1765,7 +2278,7 @@ async function checkStreamStatus(channel) {
                 streamCheckedAt: Date.now()
             });
 
-            await closeWatchTab();
+            await closeWatchTab("not_connected");
 
             return null;
         }
@@ -1781,14 +2294,25 @@ async function checkStreamStatus(channel) {
 
 
     if (!response.ok) {
-
         const errorText =
             await response.text();
 
-
-        throw new Error(
+        const error = new Error(
             `Twitch API error ${response.status}: ${errorText}`
         );
+
+        await chrome.storage.local.set({
+            streamStatus: "error",
+            streamCheckedAt: Date.now()
+        });
+
+        await recordLastError(
+            "Stream Check",
+            error,
+            channel
+        );
+
+        throw error;
     }
 
 
@@ -1836,13 +2360,29 @@ async function checkStreamStatus(channel) {
         );
 
 
+        const liveDetectedAt = Date.now();
+
+        const previousLive =
+            await chrome.storage.local.get([
+                "activeLiveStreamId"
+            ]);
+
         await chrome.storage.local.set({
 
             streamStatus:
                 "live",
 
             streamCheckedAt:
-                Date.now(),
+                liveDetectedAt,
+
+            lastLiveDetectedAt:
+                liveDetectedAt,
+
+            activeLiveStreamId:
+                stream.id,
+
+            lastError:
+                null,
 
             streamInfo: {
 
@@ -1872,6 +2412,22 @@ async function checkStreamStatus(channel) {
         });
 
 
+        if (
+            previousLive.activeLiveStreamId !==
+            stream.id
+        ) {
+            await appendActivity(
+                "live_detected",
+                {
+                    channel,
+                    message:
+                        stream.title ||
+                        "Twitch stream detected as LIVE.",
+                    at: liveDetectedAt
+                }
+            );
+        }
+
         const automation =
             await getAutomationSettings();
 
@@ -1881,7 +2437,9 @@ async function checkStreamStatus(channel) {
             );
         }
         else {
-            await closeWatchTab();
+            await closeWatchTab(
+                "auto_watch_disabled"
+            );
 
             console.log(
                 "[Auto Watch]",
@@ -1904,22 +2462,37 @@ async function checkStreamStatus(channel) {
     );
 
 
+    const offlineAt = Date.now();
+
+    const previousLive =
+        await chrome.storage.local.get([
+            "activeLiveStreamId"
+        ]);
+
     await chrome.storage.local.set({
-
-        streamStatus:
-            "offline",
-
-        streamCheckedAt:
-            Date.now(),
-
-        streamInfo:
-            null
-
+        streamStatus: "offline",
+        streamCheckedAt: offlineAt,
+        streamInfo: null,
+        lastError: null
     });
 
+    if (previousLive.activeLiveStreamId) {
+        await appendActivity(
+            "stream_offline",
+            {
+                channel,
+                message:
+                    "Configured Twitch channel is now OFFLINE.",
+                at: offlineAt
+            }
+        );
 
-    await closeWatchTab();
+        await chrome.storage.local.remove(
+            "activeLiveStreamId"
+        );
+    }
 
+    await closeWatchTab("offline");
 
     return null;
 }
@@ -1987,7 +2560,7 @@ chrome.alarms.onAlarm.addListener(
 
 
         // ==============================
-        // 每 2 分鐘檢查直播
+        // 依使用者設定的間隔檢查直播
         // ==============================
 
         if (
@@ -2041,12 +2614,21 @@ chrome.alarms.onAlarm.addListener(
 
         }
         catch (error) {
-
             console.error(
                 "[Stream Check]",
                 error
             );
 
+            await chrome.storage.local.set({
+                streamStatus: "error",
+                streamCheckedAt: Date.now()
+            });
+
+            await recordLastError(
+                "Scheduled Stream Check",
+                error,
+                result.channel
+            );
         }
     }
 );

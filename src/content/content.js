@@ -5,11 +5,15 @@
 const CLAIM_SCAN_INTERVAL_MS = 5000;
 const CLAIM_COOLDOWN_MS = 10000;
 const PLAYBACK_CHECK_INTERVAL_MS = 15000;
+const PLAYBACK_REPORT_INTERVAL_MS = 60000;
+const PLAYBACK_ERROR_REPORT_INTERVAL_MS = 120000;
 
 let lastClaimAt = 0;
 let scanTimer = null;
 let observer = null;
 let started = false;
+let lastPlaybackReportAt = 0;
+let lastPlaybackErrorReportAt = 0;
 
 const handledButtons = new WeakSet();
 
@@ -283,6 +287,76 @@ function startObserver() {
 }
 
 
+
+// ========================================
+// 回報觀看頁面 / 播放狀態
+// ========================================
+
+async function reportContentScriptActive() {
+    try {
+        await chrome.runtime.sendMessage({
+            type: "WATCH_CONTENT_ACTIVE",
+            channel: getCurrentChannel(),
+            at: Date.now()
+        });
+    }
+    catch (error) {
+        // Background worker may be unavailable for a short moment.
+    }
+}
+
+
+async function reportPlaybackHeartbeat() {
+    const now = Date.now();
+
+    if (
+        now - lastPlaybackReportAt <
+        PLAYBACK_REPORT_INTERVAL_MS
+    ) {
+        return;
+    }
+
+    lastPlaybackReportAt = now;
+
+    try {
+        await chrome.runtime.sendMessage({
+            type: "WATCH_PLAYBACK_HEARTBEAT",
+            channel: getCurrentChannel(),
+            at: now
+        });
+    }
+    catch (error) {
+        // Background worker may be unavailable for a short moment.
+    }
+}
+
+
+async function reportPlaybackError(error) {
+    const now = Date.now();
+
+    if (
+        now - lastPlaybackErrorReportAt <
+        PLAYBACK_ERROR_REPORT_INTERVAL_MS
+    ) {
+        return;
+    }
+
+    lastPlaybackErrorReportAt = now;
+
+    try {
+        await chrome.runtime.sendMessage({
+            type: "WATCH_PLAYBACK_ERROR",
+            channel: getCurrentChannel(),
+            at: now,
+            error: String(error?.message || error || "Playback could not be resumed.")
+        });
+    }
+    catch (sendError) {
+        // Ignore reporting failures.
+    }
+}
+
+
 // ========================================
 // 確保直播播放器保持播放
 // ========================================
@@ -302,6 +376,7 @@ async function ensurePlayback() {
     }
 
     if (!video.paused) {
+        await reportPlaybackHeartbeat();
         return;
     }
 
@@ -311,11 +386,15 @@ async function ensurePlayback() {
         console.log(
             "[Auto Watch] Playback resumed."
         );
+
+        await reportPlaybackHeartbeat();
     }
     catch (error) {
         console.log(
             "[Auto Watch] Browser did not allow automatic playback yet."
         );
+
+        await reportPlaybackError(error);
     }
 }
 
@@ -342,6 +421,7 @@ async function start() {
         "[Twitch Points Watcher] Content script active on managed channel."
     );
 
+    await reportContentScriptActive();
     startObserver();
 
     // 頁面一載入先掃一次
